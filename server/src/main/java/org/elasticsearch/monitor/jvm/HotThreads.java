@@ -14,6 +14,8 @@ import org.elasticsearch.common.time.DateFormatter;
 import org.elasticsearch.common.unit.TimeValue;
 
 import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.MemoryUsage;
 import java.lang.management.ThreadInfo;
 import java.lang.management.ThreadMXBean;
 import java.time.Clock;
@@ -66,7 +68,7 @@ public class HotThreads {
     }
 
     public HotThreads type(String type) {
-        if ("cpu".equals(type) || "wait".equals(type) || "block".equals(type)) {
+        if ("cpu".equals(type) || "wait".equals(type) || "block".equals(type) || "mem".equals(type)) {
             this.type = type;
         } else {
             throw new IllegalArgumentException("type not supported [" + type + "]");
@@ -120,6 +122,7 @@ public class HotThreads {
 
     private String innerDetect() throws Exception {
         ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+        MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
         if (threadBean.isThreadCpuTimeSupported() == false) {
             throw new ElasticsearchException("thread CPU time is not supported on this JDK");
         }
@@ -145,11 +148,15 @@ public class HotThreads {
             if (cpu == -1) {
                 continue;
             }
+            long threadAllocatedBytes = SunThreadInfo.getThreadAllocatedBytes(threadId);
+            if (threadAllocatedBytes == -1) {
+                continue;
+            }
             ThreadInfo info = threadBean.getThreadInfo(threadId, 0);
             if (info == null) {
                 continue;
             }
-            threadInfos.put(threadId, new MyThreadInfo(cpu, info));
+            threadInfos.put(threadId, new MyThreadInfo(cpu, threadAllocatedBytes, info));
         }
         Thread.sleep(interval.millis());
         for (long threadId : threadBean.getAllThreadIds()) {
@@ -167,9 +174,13 @@ public class HotThreads {
                 threadInfos.remove(threadId);
                 continue;
             }
+            long threadAllocatedBytes = SunThreadInfo.getThreadAllocatedBytes(threadId);
+            if (threadAllocatedBytes == -1) {
+                continue;
+            }
             MyThreadInfo data = threadInfos.get(threadId);
             if (data != null) {
-                data.setDelta(cpu, info);
+                data.setDelta(cpu, threadAllocatedBytes, info);
             } else {
                 threadInfos.remove(threadId);
             }
@@ -185,6 +196,8 @@ public class HotThreads {
             getter = o -> o.waitedTime;
         } else if ("block".equals(type)) {
             getter = o -> o.blockedTime;
+        } else if ("mem".equals(type)) {
+            getter = o -> o.threadAllocatedBytes;
         } else {
             throw new IllegalArgumentException("expected thread type to be either 'cpu', 'wait', or 'block', but was " + type);
         }
@@ -206,7 +219,7 @@ public class HotThreads {
             Thread.sleep(threadElementsSnapshotDelay.millis());
         }
         for (int t = 0; t < busiestThreads; t++) {
-            long time = getter.applyAsLong(hotties.get(t));
+            long timeOrBytes = getter.applyAsLong(hotties.get(t));
             String threadName = null;
             for (ThreadInfo[] info : allInfos) {
                 if (info != null && info[t] != null) {
@@ -221,9 +234,21 @@ public class HotThreads {
             if (threadName == null) {
                 continue; // thread is not alive yet or died before the first snapshot - ignore it!
             }
-            double percent = (((double) time) / interval.nanos()) * 100;
-            sb.append(String.format(Locale.ROOT, "%n%4.1f%% (%s out of %s) %s usage by thread '%s'%n",
-                percent, TimeValue.timeValueNanos(time), interval, type, threadName));
+
+            if ("mem".equals(type)) {
+                double percent = 0;
+                MemoryUsage memUsage = memoryMXBean.getHeapMemoryUsage();
+                long heapMax = memUsage.getMax() < 0 ? 0 : memUsage.getMax();
+                if (heapMax > 0){
+                    percent = (((double) timeOrBytes) / heapMax) * 100;
+                }
+                sb.append(String.format(Locale.ROOT, "%n%4.1f%% (%s out of %s) %s usage by thread '%s'%n",
+                    percent, timeOrBytes, heapMax, type, threadName));
+            }else {
+                double percent = (((double) timeOrBytes) / interval.nanos()) * 100;
+                sb.append(String.format(Locale.ROOT, "%n%4.1f%% (%s out of %s) %s usage by thread '%s'%n",
+                    percent, TimeValue.timeValueNanos(timeOrBytes), interval, type, threadName));
+            }
             // for each snapshot (2nd array index) find later snapshot for same thread with max number of
             // identical StackTraceElements (starting from end of each)
             boolean[] done = new boolean[threadElementsSnapshotCount];
@@ -292,24 +317,27 @@ public class HotThreads {
         long waitedCount;
         long waitedTime;
         boolean deltaDone;
+        long threadAllocatedBytes;
         ThreadInfo info;
 
-        MyThreadInfo(long cpuTime, ThreadInfo info) {
+        MyThreadInfo(long cpuTime, long threadAllocatedBytes, ThreadInfo info) {
             blockedCount = info.getBlockedCount();
             blockedTime = info.getBlockedTime();
             waitedCount = info.getWaitedCount();
             waitedTime = info.getWaitedTime();
             this.cpuTime = cpuTime;
             this.info = info;
+            this.threadAllocatedBytes= threadAllocatedBytes;
         }
 
-        void setDelta(long cpuTime, ThreadInfo info) {
+        void setDelta(long cpuTime, long threadAllocatedBytes, ThreadInfo info) {
             if (deltaDone) throw new IllegalStateException("setDelta already called once");
             blockedCount = info.getBlockedCount() - blockedCount;
             blockedTime = info.getBlockedTime() - blockedTime;
             waitedCount = info.getWaitedCount() - waitedCount;
             waitedTime = info.getWaitedTime() - waitedTime;
             this.cpuTime = cpuTime - this.cpuTime;
+            this.threadAllocatedBytes = threadAllocatedBytes - this.threadAllocatedBytes;
             deltaDone = true;
             this.info = info;
         }
